@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demandes Modification Popups</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<!-- Firebase -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, collection, addDoc, getDocs, doc, updateDoc,
+           query, orderBy, onSnapshot, serverTimestamp }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+  // ── 🔧 CONFIGURATION FIREBASE ──────────────────────────────────────────────
+  const firebaseConfig = {
+    apiKey:            "VOTRE_API_KEY",
+    authDomain:        "VOTRE_PROJECT.firebaseapp.com",
+    projectId:         "VOTRE_PROJECT_ID",
+    storageBucket:     "VOTRE_PROJECT.appspot.com",
+    messagingSenderId: "VOTRE_SENDER_ID",
+    appId:             "VOTRE_APP_ID"
+  };
+  // ──────────────────────────────────────────────────────────────────────────
+
+  const app  = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  // Rôles qualité (emails autorisés à répondre)
+  const QUALITE_EMAILS = ["qualite@votre-domaine.fr"];
+
+  let currentUser = null;
+  let isQualite   = false;
+  let unsubscribe = null;
+
+  // ── Utilitaires ────────────────────────────────────────────────────────────
+  function fmt(ts) {
+    if (!ts) return "—";
+    const d = ts.toDate ? ts.toDate() : new Date(ts);
+    return d.toLocaleDateString("fr-FR", { day:"2-digit", month:"2-digit", year:"numeric",
+                                           hour:"2-digit", minute:"2-digit" });
+  }
+
+  function statusBadge(status) {
+    const map = {
+      nouveau:   { label:"Nouveau",   cls:"badge-new"  },
+      en_cours:  { label:"En cours",  cls:"badge-wip"  },
+      resolu:    { label:"Résolu",    cls:"badge-done" },
+    };
+    const s = map[status] || map.nouveau;
+    return `<span class="badge ${s.cls}">${s.label}</span>`;
+  }
+
+  // ── Rendu liste demandes ───────────────────────────────────────────────────
+  function renderDemandes(demandes) {
+    const list = document.getElementById("list");
+    if (!demandes.length) {
+      list.innerHTML = `<div class="empty">Aucune demande pour le moment.</div>`;
+      return;
+    }
+
+    list.innerHTML = demandes.map(d => `
+      <div class="card" data-id="${d.id}">
+        <div class="card-header">
+          <div class="symbol-badge">${d.symbole}</div>
+          <div class="card-meta">
+            <span class="meta-who">${d.demandeur}</span>
+            <span class="meta-date">${fmt(d.dateDemande)}</span>
+          </div>
+          ${statusBadge(d.statut)}
+        </div>
+
+        <div class="card-reason">
+          <span class="label-reason">Raison</span>
+          <p>${d.raison}</p>
+        </div>
+
+        ${d.reponse ? `
+        <div class="card-reply">
+          <span class="label-reply">✓ Réponse Qualité</span>
+          <p>${d.reponse}</p>
+          <span class="reply-date">${fmt(d.dateReponse)}</span>
+        </div>` : ""}
+
+        ${isQualite ? `
+        <div class="card-actions">
+          <select class="select-status" data-id="${d.id}">
+            <option value="nouveau"  ${d.statut==="nouveau"  ?"selected":""}>Nouveau</option>
+            <option value="en_cours" ${d.statut==="en_cours" ?"selected":""}>En cours</option>
+            <option value="resolu"   ${d.statut==="resolu"   ?"selected":""}>Résolu</option>
+          </select>
+          <textarea class="reply-input" placeholder="Réponse du service Qualité…" data-id="${d.id}">${d.reponse||""}</textarea>
+          <button class="btn-reply" data-id="${d.id}">Enregistrer</button>
+        </div>` : ""}
+      </div>
+    `).join("");
+
+    // Listeners boutons qualité
+    list.querySelectorAll(".btn-reply").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id      = btn.dataset.id;
+        const reponse = list.querySelector(`.reply-input[data-id="${id}"]`).value.trim();
+        const statut  = list.querySelector(`.select-status[data-id="${id}"]`).value;
+        if (!reponse) { alert("Veuillez saisir une réponse."); return; }
+        btn.disabled = true; btn.textContent = "…";
+        await updateDoc(doc(db, "demandes", id), {
+          reponse, statut, dateReponse: serverTimestamp(), repondantEmail: currentUser.email
+        });
+        btn.textContent = "✓ Enregistré";
+      });
+    });
+  }
+
+  // ── Écoute temps réel ──────────────────────────────────────────────────────
+  function startListen() {
+    if (unsubscribe) unsubscribe();
+    const q = query(collection(db, "demandes"), orderBy("dateDemande", "desc"));
+    unsubscribe = onSnapshot(q, snap => {
+      const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      // Filtre si pas qualité : on voit seulement ses demandes
+      const filtered = isQualite ? docs : docs.filter(d => d.demandeurEmail === currentUser.email);
+      renderDemandes(filtered);
+      document.getElementById("counter").textContent =
+        isQualite ? `${docs.filter(d=>d.statut==="nouveau").length} nouvelle(s) demande(s) en attente`
+                  : `${filtered.length} demande(s)`;
+    });
+  }
+
+  // ── Soumission nouvelle demande ────────────────────────────────────────────
+  window.submitDemande = async function() {
+    const symbole   = document.getElementById("f-symbole").value.trim();
+    const raison    = document.getElementById("f-raison").value.trim();
+    const demandeur = document.getElementById("f-demandeur").value.trim();
+
+    if (!symbole || !raison || !demandeur) {
+      showFormError("Veuillez remplir tous les champs."); return;
+    }
+
+    const btn = document.getElementById("btn-submit");
+    btn.disabled = true; btn.textContent = "Envoi…";
+
+    try {
+      await addDoc(collection(db, "demandes"), {
+        symbole, raison, demandeur,
+        demandeurEmail: currentUser.email,
+        dateDemande: serverTimestamp(),
+        statut: "nouveau",
+        reponse: null,
+        dateReponse: null
+      });
+      document.getElementById("f-symbole").value   = "";
+      document.getElementById("f-raison").value    = "";
+      document.getElementById("f-demandeur").value = "";
+      showFormSuccess("Demande envoyée au service Qualité !");
+    } catch(e) {
+      showFormError("Erreur : " + e.message);
+    }
+    btn.disabled = false; btn.textContent = "Envoyer la demande";
+  };
+
+  function showFormError(msg) {
+    const el = document.getElementById("form-msg");
+    el.textContent = msg; el.className = "form-msg error";
+    setTimeout(() => el.textContent = "", 4000);
+  }
+  function showFormSuccess(msg) {
+    const el = document.getElementById("form-msg");
+    el.textContent = msg; el.className = "form-msg success";
+    setTimeout(() => el.textContent = "", 4000);
+  }
+
+  // ── Auth ───────────────────────────────────────────────────────────────────
+  window.doLogin = async function() {
+    const email = document.getElementById("login-email").value.trim();
+    const pass  = document.getElementById("login-pass").value;
+    const errEl = document.getElementById("login-err");
+    errEl.textContent = "";
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+    } catch(e) {
+      errEl.textContent = "Identifiants incorrects.";
+    }
+  };
+
+  window.doLogout = async function() {
+    if (unsubscribe) unsubscribe();
+    await signOut(auth);
+  };
+
+  onAuthStateChanged(auth, user => {
+    currentUser = user;
+    if (user) {
+      isQualite = QUALITE_EMAILS.includes(user.email);
+      document.getElementById("screen-login").style.display  = "none";
+      document.getElementById("screen-app").style.display    = "flex";
+      document.getElementById("user-email").textContent      = user.email;
+      document.getElementById("user-role").textContent       = isQualite ? "Service Qualité" : "Demandeur";
+      document.getElementById("form-section").style.display  = isQualite ? "none" : "block";
+      startListen();
+    } else {
+      document.getElementById("screen-login").style.display  = "flex";
+      document.getElementById("screen-app").style.display    = "none";
+    }
+  });
+</script>
+
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --navy:   #1A2F4E;
+  --navy2:  #243d63;
+  --bg:     #F7F9FC;
+  --orange: #E05A00;
+  --green:  #2E7D52;
+  --gray:   #6B7A8D;
+  --border: #DDE3EC;
+  --white:  #ffffff;
+  --font:   'Inter', sans-serif;
+  --radius: 10px;
+}
+
+body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-height: 100vh; }
+
+/* ── LOGIN ── */
+#screen-login {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; background: linear-gradient(135deg, var(--navy) 0%, var(--navy2) 100%);
+}
+.login-box {
+  background: var(--white); border-radius: 16px; padding: 40px 36px;
+  width: 360px; box-shadow: 0 20px 60px rgba(0,0,0,.25);
+}
+.login-logo {
+  text-align: center; margin-bottom: 28px;
+}
+.login-logo .icon { font-size: 36px; }
+.login-logo h1 { font-size: 18px; font-weight: 700; color: var(--navy); margin-top: 8px; }
+.login-logo p  { font-size: 12px; color: var(--gray); margin-top: 3px; }
+
+.field { margin-bottom: 16px; }
+.field label { display: block; font-size: 12px; font-weight: 600; color: var(--gray);
+               text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
+.field input, .field textarea, .field select {
+  width: 100%; padding: 10px 12px; border: 1.5px solid var(--border);
+  border-radius: 8px; font-family: var(--font); font-size: 14px;
+  color: var(--navy); background: var(--white); transition: border .2s;
+}
+.field input:focus, .field textarea:focus, .field select:focus {
+  outline: none; border-color: var(--orange);
+}
+.btn-primary {
+  width: 100%; padding: 12px; background: var(--orange); color: var(--white);
+  border: none; border-radius: 8px; font-family: var(--font); font-size: 14px;
+  font-weight: 600; cursor: pointer; transition: background .2s, transform .1s;
+}
+.btn-primary:hover  { background: #c44e00; }
+.btn-primary:active { transform: scale(.98); }
+.btn-primary:disabled { opacity: .6; cursor: not-allowed; }
+#login-err { color: #c0392b; font-size: 12px; margin-top: 8px; text-align: center; }
+
+/* ── APP ── */
+#screen-app { display: none; flex-direction: column; min-height: 100vh; }
+
+/* Topbar */
+.topbar {
+  background: var(--navy); color: var(--white);
+  padding: 0 24px; height: 56px;
+  display: flex; align-items: center; justify-content: space-between;
+  position: sticky; top: 0; z-index: 10;
+}
+.topbar-left { display: flex; align-items: center; gap: 10px; }
+.topbar-left .ticon { font-size: 20px; }
+.topbar-left h2 { font-size: 15px; font-weight: 700; }
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+.user-pill {
+  background: rgba(255,255,255,.12); border-radius: 20px;
+  padding: 4px 12px; font-size: 12px;
+}
+.user-pill strong { color: #fff; }
+.user-pill .role { color: #aac4ff; font-size: 11px; margin-left: 6px; }
+.btn-logout {
+  background: rgba(255,255,255,.15); border: none; color: var(--white);
+  border-radius: 6px; padding: 6px 12px; font-size: 12px; font-family: var(--font);
+  cursor: pointer; transition: background .2s;
+}
+.btn-logout:hover { background: rgba(255,255,255,.25); }
+
+/* Layout */
+.app-body { display: flex; flex: 1; gap: 0; }
+
+/* Sidebar form */
+#form-section {
+  width: 320px; min-width: 320px; background: var(--white);
+  border-right: 1px solid var(--border); padding: 24px;
+}
+#form-section h3 { font-size: 14px; font-weight: 700; color: var(--navy);
+                   margin-bottom: 20px; padding-bottom: 12px; border-bottom: 2px solid var(--orange); }
+#form-section .field textarea { resize: vertical; min-height: 90px; }
+.form-msg { font-size: 12px; margin-top: 10px; padding: 8px 10px; border-radius: 6px; }
+.form-msg.error   { background: #fde8e8; color: #c0392b; }
+.form-msg.success { background: #e8f5ee; color: var(--green); }
+
+/* List panel */
+.list-panel { flex: 1; padding: 24px; overflow-y: auto; }
+.list-panel-header {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;
+}
+.list-panel-header h3 { font-size: 16px; font-weight: 700; color: var(--navy); }
+#counter { font-size: 12px; color: var(--gray); background: var(--border);
+           border-radius: 20px; padding: 3px 10px; }
+
+/* Cards */
+.card {
+  background: var(--white); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px 20px; margin-bottom: 14px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.04);
+  transition: box-shadow .2s;
+}
+.card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.08); }
+
+.card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.symbol-badge {
+  background: var(--navy); color: var(--white); border-radius: 8px;
+  padding: 6px 12px; font-size: 13px; font-weight: 700; font-family: monospace;
+  white-space: nowrap;
+}
+.card-meta { flex: 1; }
+.meta-who  { display: block; font-size: 13px; font-weight: 600; color: var(--navy); }
+.meta-date { font-size: 11px; color: var(--gray); }
+
+/* Badges statut */
+.badge {
+  border-radius: 20px; padding: 4px 10px; font-size: 11px; font-weight: 600;
+  white-space: nowrap;
+}
+.badge-new  { background: #FFF3E0; color: #E65100; animation: pulse-new 2s infinite; }
+.badge-wip  { background: #E3F2FD; color: #1565C0; }
+.badge-done { background: #E8F5E9; color: var(--green); }
+
+@keyframes pulse-new {
+  0%,100% { box-shadow: 0 0 0 0 rgba(224,90,0,.3); }
+  50%      { box-shadow: 0 0 0 5px rgba(224,90,0,0); }
+}
+
+.label-reason, .label-reply {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--gray); display: block; margin-bottom: 4px;
+}
+.card-reason p { font-size: 13px; color: #333; line-height: 1.5; }
+
+.card-reply {
+  margin-top: 12px; background: #e8f5ee; border-radius: 8px;
+  padding: 10px 14px; border-left: 3px solid var(--green);
+}
+.label-reply { color: var(--green); }
+.card-reply p { font-size: 13px; color: #1a3d2b; line-height: 1.5; }
+.reply-date { font-size: 11px; color: var(--gray); margin-top: 4px; display: block; }
+
+/* Actions qualité */
+.card-actions {
+  margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.select-status {
+  padding: 7px 10px; border: 1.5px solid var(--border); border-radius: 7px;
+  font-family: var(--font); font-size: 13px; color: var(--navy);
+  background: var(--bg); cursor: pointer;
+}
+.reply-input {
+  width: 100%; padding: 9px 12px; border: 1.5px solid var(--border);
+  border-radius: 7px; font-family: var(--font); font-size: 13px;
+  color: var(--navy); resize: vertical; min-height: 70px;
+  transition: border .2s;
+}
+.reply-input:focus { outline: none; border-color: var(--green); }
+.btn-reply {
+  align-self: flex-end; padding: 8px 18px; background: var(--green); color: var(--white);
+  border: none; border-radius: 7px; font-family: var(--font); font-size: 13px;
+  font-weight: 600; cursor: pointer; transition: background .2s;
+}
+.btn-reply:hover    { background: #245f3e; }
+.btn-reply:disabled { opacity: .6; }
+
+.empty { text-align: center; color: var(--gray); padding: 60px 20px; font-size: 14px; }
+
+/* Responsive */
+@media(max-width: 700px) {
+  .app-body   { flex-direction: column; }
+  #form-section { width: 100%; min-width: unset; border-right: none;
+                  border-bottom: 1px solid var(--border); }
+  .topbar-left h2 { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ LOGIN ════════════════════════════════════════════════════════════════ -->
+<div id="screen-login">
+  <div class="login-box">
+    <div class="login-logo">
+      <div class="icon">🔧</div>
+      <h1>Demandes Popups</h1>
+      <p>Gestion des modifications · Service Qualité</p>
+    </div>
+    <div class="field">
+      <label>Adresse e-mail</label>
+      <input type="email" id="login-email" placeholder="prenom.nom@domaine.fr"
+             onkeydown="if(event.key==='Enter') doLogin()">
+    </div>
+    <div class="field">
+      <label>Mot de passe</label>
+      <input type="password" id="login-pass" placeholder="••••••••"
+             onkeydown="if(event.key==='Enter') doLogin()">
+    </div>
+    <button class="btn-primary" onclick="doLogin()">Se connecter</button>
+    <div id="login-err"></div>
+  </div>
+</div>
+
+<!-- ═══ APP ═══════════════════════════════════════════════════════════════════ -->
+<div id="screen-app">
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="ticon">🔧</span>
+      <h2>Demandes Modification Popups</h2>
+    </div>
+    <div class="topbar-right">
+      <div class="user-pill">
+        <strong id="user-email"></strong>
+        <span class="role" id="user-role"></span>
+      </div>
+      <button class="btn-logout" onclick="doLogout()">Déconnexion</button>
+    </div>
+  </header>
+
+  <div class="app-body">
+
+    <!-- Formulaire (masqué pour Qualité) -->
+    <aside id="form-section">
+      <h3>Nouvelle demande</h3>
+
+      <div class="field">
+        <label>Symbole</label>
+        <input type="text" id="f-symbole" placeholder="ex. SYM-042">
+      </div>
+      <div class="field">
+        <label>Votre nom / prénom</label>
+        <input type="text" id="f-demandeur" placeholder="ex. Jean Dupont">
+      </div>
+      <div class="field">
+        <label>Raison de la demande</label>
+        <textarea id="f-raison" placeholder="Décrivez pourquoi cette popup doit être modifiée…"></textarea>
+      </div>
+
+      <button class="btn-primary" id="btn-submit" onclick="submitDemande()">
+        Envoyer la demande
+      </button>
+      <div id="form-msg" class="form-msg"></div>
+    </aside>
+
+    <!-- Liste des demandes -->
+    <main class="list-panel">
+      <div class="list-panel-header">
+        <h3>Demandes en cours</h3>
+        <span id="counter">—</span>
+      </div>
+      <div id="list"></div>
+    </main>
+
+  </div>
+</div>
+
+</body>
+</html>
