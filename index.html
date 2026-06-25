@@ -7,38 +7,44 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 
-<!-- Firebase -->
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-  import { getFirestore, collection, addDoc, getDocs, doc, updateDoc,
-           query, orderBy, onSnapshot, serverTimestamp }
+  import { getFirestore, collection, addDoc, doc, updateDoc, deleteDoc,
+           query, orderBy, onSnapshot, serverTimestamp, getDoc, setDoc }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
-  // ── 🔧 CONFIGURATION FIREBASE ──────────────────────────────────────────────
+  // ── 🔧 CONFIGURATION FIREBASE ─────────────────────────────────────────────
   const firebaseConfig = {
-  apiKey: "AIzaSyAgyjanFGdNCe23ptWtrLgI1wUSZij5y9I",
-  authDomain: "popup-67e28.firebaseapp.com",
-  projectId: "popup-67e28",
-  storageBucket: "popup-67e28.firebasestorage.app",
-  messagingSenderId: "1089603775753",
-  appId: "1:1089603775753:web:0eda8de1f0b5d6e34af7d8"
+    apiKey:            "VOTRE_API_KEY",
+    authDomain:        "VOTRE_PROJECT.firebaseapp.com",
+    projectId:         "VOTRE_PROJECT_ID",
+    storageBucket:     "VOTRE_PROJECT.appspot.com",
+    messagingSenderId: "VOTRE_SENDER_ID",
+    appId:             "VOTRE_APP_ID"
   };
-  // ──────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Email du super-admin (seul autorisé à gérer les rôles)
+  // C'est le SEUL email qui reste dans le code — il ne change jamais.
+  const SUPER_ADMIN = "admin@votre-domaine.fr";
 
   const app  = initializeApp(firebaseConfig);
   const auth = getAuth(app);
   const db   = getFirestore(app);
 
-  // Rôles qualité (emails autorisés à répondre)
-  const QUALITE_EMAILS = ["qualite@votre-domaine.fr"];
+  // Référence du document de config des rôles dans Firestore
+  const rolesRef = doc(db, "config", "roles");
 
-  let currentUser = null;
-  let isQualite   = false;
-  let unsubscribe = null;
+  let currentUser    = null;
+  let isQualite      = false;
+  let isAdmin        = false;
+  let qualiteEmails  = [];   // chargé depuis Firestore
+  let unsubDemandes  = null;
+  let activeTab      = "demandes";
 
-  // ── Utilitaires ────────────────────────────────────────────────────────────
+  // ── Utilitaires ──────────────────────────────────────────────────────────
   function fmt(ts) {
     if (!ts) return "—";
     const d = ts.toDate ? ts.toDate() : new Date(ts);
@@ -48,22 +54,40 @@
 
   function statusBadge(status) {
     const map = {
-      nouveau:   { label:"Nouveau",   cls:"badge-new"  },
-      en_cours:  { label:"En cours",  cls:"badge-wip"  },
-      resolu:    { label:"Résolu",    cls:"badge-done" },
+      nouveau:  { label:"Nouveau",  cls:"badge-new"  },
+      en_cours: { label:"En cours", cls:"badge-wip"  },
+      resolu:   { label:"Résolu",   cls:"badge-done" },
     };
     const s = map[status] || map.nouveau;
     return `<span class="badge ${s.cls}">${s.label}</span>`;
   }
 
-  // ── Rendu liste demandes ───────────────────────────────────────────────────
+  // ── Chargement des rôles depuis Firestore ────────────────────────────────
+  async function loadRoles() {
+    try {
+      const snap = await getDoc(rolesRef);
+      qualiteEmails = snap.exists() ? (snap.data().qualite || []) : [];
+    } catch(e) {
+      qualiteEmails = [];
+    }
+  }
+
+  // ── Onglets ───────────────────────────────────────────────────────────────
+  window.switchTab = function(tab) {
+    activeTab = tab;
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+    document.getElementById("panel-demandes").style.display = tab === "demandes" ? "flex" : "none";
+    document.getElementById("panel-admin").style.display    = tab === "admin"    ? "block" : "none";
+    if (tab === "admin") renderAdmin();
+  };
+
+  // ── Rendu liste demandes ──────────────────────────────────────────────────
   function renderDemandes(demandes) {
     const list = document.getElementById("list");
     if (!demandes.length) {
       list.innerHTML = `<div class="empty">Aucune demande pour le moment.</div>`;
       return;
     }
-
     list.innerHTML = demandes.map(d => `
       <div class="card" data-id="${d.id}">
         <div class="card-header">
@@ -74,19 +98,16 @@
           </div>
           ${statusBadge(d.statut)}
         </div>
-
         <div class="card-reason">
           <span class="label-reason">Raison</span>
           <p>${d.raison}</p>
         </div>
-
         ${d.reponse ? `
         <div class="card-reply">
           <span class="label-reply">✓ Réponse Qualité</span>
           <p>${d.reponse}</p>
           <span class="reply-date">${fmt(d.dateReponse)}</span>
         </div>` : ""}
-
         ${isQualite ? `
         <div class="card-actions">
           <select class="select-status" data-id="${d.id}">
@@ -100,7 +121,6 @@
       </div>
     `).join("");
 
-    // Listeners boutons qualité
     list.querySelectorAll(".btn-reply").forEach(btn => {
       btn.addEventListener("click", async () => {
         const id      = btn.dataset.id;
@@ -116,102 +136,143 @@
     });
   }
 
-  // ── Écoute temps réel ──────────────────────────────────────────────────────
+  // ── Écoute temps réel ─────────────────────────────────────────────────────
   function startListen() {
-    if (unsubscribe) unsubscribe();
+    if (unsubDemandes) unsubDemandes();
     const q = query(collection(db, "demandes"), orderBy("dateDemande", "desc"));
-    unsubscribe = onSnapshot(q, snap => {
-      const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-      // Filtre si pas qualité : on voit seulement ses demandes
-      const filtered = isQualite ? docs : docs.filter(d => d.demandeurEmail === currentUser.email);
+    unsubDemandes = onSnapshot(q, snap => {
+      const all      = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const filtered = isQualite ? all : all.filter(d => d.demandeurEmail === currentUser.email);
       renderDemandes(filtered);
+      const nbNew = isQualite
+        ? all.filter(d => d.statut === "nouveau").length
+        : filtered.length;
       document.getElementById("counter").textContent =
-        isQualite ? `${docs.filter(d=>d.statut==="nouveau").length} nouvelle(s) demande(s) en attente`
-                  : `${filtered.length} demande(s)`;
+        isQualite ? `${nbNew} en attente` : `${filtered.length} demande(s)`;
     });
   }
 
-  // ── Soumission nouvelle demande ────────────────────────────────────────────
+  // ── Nouvelle demande ──────────────────────────────────────────────────────
   window.submitDemande = async function() {
     const symbole   = document.getElementById("f-symbole").value.trim();
     const raison    = document.getElementById("f-raison").value.trim();
     const demandeur = document.getElementById("f-demandeur").value.trim();
-
-    if (!symbole || !raison || !demandeur) {
-      showFormError("Veuillez remplir tous les champs."); return;
-    }
-
+    if (!symbole || !raison || !demandeur) { showFormMsg("Veuillez remplir tous les champs.", "error"); return; }
     const btn = document.getElementById("btn-submit");
     btn.disabled = true; btn.textContent = "Envoi…";
-
     try {
       await addDoc(collection(db, "demandes"), {
         symbole, raison, demandeur,
         demandeurEmail: currentUser.email,
         dateDemande: serverTimestamp(),
-        statut: "nouveau",
-        reponse: null,
-        dateReponse: null
+        statut: "nouveau", reponse: null, dateReponse: null
       });
-      document.getElementById("f-symbole").value   = "";
-      document.getElementById("f-raison").value    = "";
+      document.getElementById("f-symbole").value = "";
+      document.getElementById("f-raison").value  = "";
       document.getElementById("f-demandeur").value = "";
-      showFormSuccess("Demande envoyée au service Qualité !");
-    } catch(e) {
-      showFormError("Erreur : " + e.message);
-    }
+      showFormMsg("Demande envoyée au service Qualité !", "success");
+    } catch(e) { showFormMsg("Erreur : " + e.message, "error"); }
     btn.disabled = false; btn.textContent = "Envoyer la demande";
   };
 
-  function showFormError(msg) {
+  function showFormMsg(msg, type) {
     const el = document.getElementById("form-msg");
-    el.textContent = msg; el.className = "form-msg error";
-    setTimeout(() => el.textContent = "", 4000);
-  }
-  function showFormSuccess(msg) {
-    const el = document.getElementById("form-msg");
-    el.textContent = msg; el.className = "form-msg success";
+    el.textContent = msg; el.className = `form-msg ${type}`;
     setTimeout(() => el.textContent = "", 4000);
   }
 
-  // ── Auth ───────────────────────────────────────────────────────────────────
+  // ── ADMIN : gestion des emails Qualité ───────────────────────────────────
+  function renderAdmin() {
+    const panel = document.getElementById("admin-emails-list");
+    if (!qualiteEmails.length) {
+      panel.innerHTML = `<div class="admin-empty">Aucun email Qualité enregistré.</div>`;
+      return;
+    }
+    panel.innerHTML = qualiteEmails.map((email, i) => `
+      <div class="admin-email-row">
+        <span class="admin-email-text">📧 ${email}</span>
+        <button class="btn-remove" data-idx="${i}" onclick="removeQualiteEmail(${i})">✕ Retirer</button>
+      </div>
+    `).join("");
+  }
+
+  window.addQualiteEmail = async function() {
+    const input = document.getElementById("admin-new-email");
+    const email = input.value.trim().toLowerCase();
+    if (!email || !email.includes("@")) { showAdminMsg("Email invalide.", "error"); return; }
+    if (qualiteEmails.includes(email))  { showAdminMsg("Cet email est déjà dans la liste.", "error"); return; }
+    qualiteEmails = [...qualiteEmails, email];
+    await saveRoles();
+    input.value = "";
+    showAdminMsg(`${email} ajouté au service Qualité.`, "success");
+    renderAdmin();
+  };
+
+  window.removeQualiteEmail = async function(idx) {
+    const email = qualiteEmails[idx];
+    if (!confirm(`Retirer ${email} du service Qualité ?`)) return;
+    qualiteEmails = qualiteEmails.filter((_, i) => i !== idx);
+    await saveRoles();
+    showAdminMsg(`${email} retiré.`, "success");
+    renderAdmin();
+  };
+
+  async function saveRoles() {
+    await setDoc(rolesRef, { qualite: qualiteEmails });
+  }
+
+  function showAdminMsg(msg, type) {
+    const el = document.getElementById("admin-msg");
+    el.textContent = msg; el.className = `form-msg ${type}`;
+    setTimeout(() => el.textContent = "", 4000);
+  }
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
   window.doLogin = async function() {
     const email = document.getElementById("login-email").value.trim();
     const pass  = document.getElementById("login-pass").value;
-    const errEl = document.getElementById("login-err");
-    errEl.textContent = "";
+    document.getElementById("login-err").textContent = "";
     try {
       await signInWithEmailAndPassword(auth, email, pass);
     } catch(e) {
-      errEl.textContent = "Identifiants incorrects.";
+      document.getElementById("login-err").textContent = "Identifiants incorrects.";
     }
   };
 
   window.doLogout = async function() {
-    if (unsubscribe) unsubscribe();
+    if (unsubDemandes) unsubDemandes();
     await signOut(auth);
   };
 
-  onAuthStateChanged(auth, user => {
+  onAuthStateChanged(auth, async user => {
     currentUser = user;
     if (user) {
-      isQualite = QUALITE_EMAILS.includes(user.email);
-      document.getElementById("screen-login").style.display  = "none";
-      document.getElementById("screen-app").style.display    = "flex";
-      document.getElementById("user-email").textContent      = user.email;
-      document.getElementById("user-role").textContent       = isQualite ? "Service Qualité" : "Demandeur";
-      document.getElementById("form-section").style.display  = isQualite ? "none" : "block";
+      await loadRoles();
+      isAdmin   = user.email === SUPER_ADMIN;
+      isQualite = isAdmin || qualiteEmails.includes(user.email);
+
+      document.getElementById("screen-login").style.display = "none";
+      document.getElementById("screen-app").style.display   = "flex";
+      document.getElementById("user-email").textContent     = user.email;
+      document.getElementById("user-role").textContent      =
+        isAdmin ? "Administrateur" : isQualite ? "Service Qualité" : "Demandeur";
+
+      // Onglet Admin visible seulement pour le super-admin
+      document.getElementById("tab-admin").style.display = isAdmin ? "inline-flex" : "none";
+      // Formulaire masqué pour Qualité/Admin
+      document.getElementById("form-section").style.display = (isQualite || isAdmin) ? "none" : "block";
+
+      switchTab("demandes");
       startListen();
     } else {
-      document.getElementById("screen-login").style.display  = "flex";
-      document.getElementById("screen-app").style.display    = "none";
+      document.getElementById("screen-login").style.display = "flex";
+      document.getElementById("screen-app").style.display   = "none";
     }
   });
 </script>
 
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
 :root {
   --navy:   #1A2F4E;
   --navy2:  #243d63;
@@ -224,10 +285,9 @@
   --font:   'Inter', sans-serif;
   --radius: 10px;
 }
-
 body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-height: 100vh; }
 
-/* ── LOGIN ── */
+/* LOGIN */
 #screen-login {
   display: flex; align-items: center; justify-content: center;
   min-height: 100vh; background: linear-gradient(135deg, var(--navy) 0%, var(--navy2) 100%);
@@ -236,9 +296,7 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
   background: var(--white); border-radius: 16px; padding: 40px 36px;
   width: 360px; box-shadow: 0 20px 60px rgba(0,0,0,.25);
 }
-.login-logo {
-  text-align: center; margin-bottom: 28px;
-}
+.login-logo { text-align: center; margin-bottom: 28px; }
 .login-logo .icon { font-size: 36px; }
 .login-logo h1 { font-size: 18px; font-weight: 700; color: var(--navy); margin-top: 8px; }
 .login-logo p  { font-size: 12px; color: var(--gray); margin-top: 3px; }
@@ -248,12 +306,10 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
                text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
 .field input, .field textarea, .field select {
   width: 100%; padding: 10px 12px; border: 1.5px solid var(--border);
-  border-radius: 8px; font-family: var(--font); font-size: 14px;
-  color: var(--navy); background: var(--white); transition: border .2s;
+  border-radius: 8px; font-family: var(--font); font-size: 14px; color: var(--navy);
+  background: var(--white); transition: border .2s;
 }
-.field input:focus, .field textarea:focus, .field select:focus {
-  outline: none; border-color: var(--orange);
-}
+.field input:focus, .field textarea:focus { outline: none; border-color: var(--orange); }
 .btn-primary {
   width: 100%; padding: 12px; background: var(--orange); color: var(--white);
   border: none; border-radius: 8px; font-family: var(--font); font-size: 14px;
@@ -264,7 +320,7 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
 .btn-primary:disabled { opacity: .6; cursor: not-allowed; }
 #login-err { color: #c0392b; font-size: 12px; margin-top: 8px; text-align: center; }
 
-/* ── APP ── */
+/* APP */
 #screen-app { display: none; flex-direction: column; min-height: 100vh; }
 
 /* Topbar */
@@ -274,16 +330,28 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
   display: flex; align-items: center; justify-content: space-between;
   position: sticky; top: 0; z-index: 10;
 }
-.topbar-left { display: flex; align-items: center; gap: 10px; }
+.topbar-left { display: flex; align-items: center; gap: 16px; }
 .topbar-left .ticon { font-size: 20px; }
 .topbar-left h2 { font-size: 15px; font-weight: 700; }
+
+/* Onglets dans la topbar */
+.tabs { display: flex; gap: 4px; }
+.tab-btn {
+  background: rgba(255,255,255,.1); border: none; color: rgba(255,255,255,.7);
+  border-radius: 6px; padding: 6px 14px; font-family: var(--font); font-size: 13px;
+  font-weight: 500; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+  transition: background .2s, color .2s;
+}
+.tab-btn:hover  { background: rgba(255,255,255,.18); color: #fff; }
+.tab-btn.active { background: var(--orange); color: #fff; }
+
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 .user-pill {
   background: rgba(255,255,255,.12); border-radius: 20px;
   padding: 4px 12px; font-size: 12px;
 }
 .user-pill strong { color: #fff; }
-.user-pill .role { color: #aac4ff; font-size: 11px; margin-left: 6px; }
+.user-pill .role  { color: #aac4ff; font-size: 11px; margin-left: 6px; }
 .btn-logout {
   background: rgba(255,255,255,.15); border: none; color: var(--white);
   border-radius: 6px; padding: 6px 12px; font-size: 12px; font-family: var(--font);
@@ -291,8 +359,9 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
 }
 .btn-logout:hover { background: rgba(255,255,255,.25); }
 
-/* Layout */
-.app-body { display: flex; flex: 1; gap: 0; }
+/* Panels */
+#panel-demandes { display: flex; flex: 1; }
+#panel-admin    { display: none; flex: 1; padding: 32px; max-width: 640px; margin: 0 auto; width: 100%; }
 
 /* Sidebar form */
 #form-section {
@@ -302,6 +371,7 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
 #form-section h3 { font-size: 14px; font-weight: 700; color: var(--navy);
                    margin-bottom: 20px; padding-bottom: 12px; border-bottom: 2px solid var(--orange); }
 #form-section .field textarea { resize: vertical; min-height: 90px; }
+
 .form-msg { font-size: 12px; margin-top: 10px; padding: 8px 10px; border-radius: 6px; }
 .form-msg.error   { background: #fde8e8; color: #c0392b; }
 .form-msg.success { background: #e8f5ee; color: var(--green); }
@@ -319,30 +389,22 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
 .card {
   background: var(--white); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 18px 20px; margin-bottom: 14px;
-  box-shadow: 0 2px 8px rgba(0,0,0,.04);
-  transition: box-shadow .2s;
+  box-shadow: 0 2px 8px rgba(0,0,0,.04); transition: box-shadow .2s;
 }
 .card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.08); }
-
 .card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .symbol-badge {
   background: var(--navy); color: var(--white); border-radius: 8px;
   padding: 6px 12px; font-size: 13px; font-weight: 700; font-family: monospace;
-  white-space: nowrap;
 }
 .card-meta { flex: 1; }
 .meta-who  { display: block; font-size: 13px; font-weight: 600; color: var(--navy); }
 .meta-date { font-size: 11px; color: var(--gray); }
 
-/* Badges statut */
-.badge {
-  border-radius: 20px; padding: 4px 10px; font-size: 11px; font-weight: 600;
-  white-space: nowrap;
-}
+.badge { border-radius: 20px; padding: 4px 10px; font-size: 11px; font-weight: 600; white-space: nowrap; }
 .badge-new  { background: #FFF3E0; color: #E65100; animation: pulse-new 2s infinite; }
 .badge-wip  { background: #E3F2FD; color: #1565C0; }
 .badge-done { background: #E8F5E9; color: var(--green); }
-
 @keyframes pulse-new {
   0%,100% { box-shadow: 0 0 0 0 rgba(224,90,0,.3); }
   50%      { box-shadow: 0 0 0 5px rgba(224,90,0,0); }
@@ -353,7 +415,6 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
   letter-spacing: .06em; color: var(--gray); display: block; margin-bottom: 4px;
 }
 .card-reason p { font-size: 13px; color: #333; line-height: 1.5; }
-
 .card-reply {
   margin-top: 12px; background: #e8f5ee; border-radius: 8px;
   padding: 10px 14px; border-left: 3px solid var(--green);
@@ -362,7 +423,6 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
 .card-reply p { font-size: 13px; color: #1a3d2b; line-height: 1.5; }
 .reply-date { font-size: 11px; color: var(--gray); margin-top: 4px; display: block; }
 
-/* Actions qualité */
 .card-actions {
   margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 8px;
@@ -375,8 +435,7 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
 .reply-input {
   width: 100%; padding: 9px 12px; border: 1.5px solid var(--border);
   border-radius: 7px; font-family: var(--font); font-size: 13px;
-  color: var(--navy); resize: vertical; min-height: 70px;
-  transition: border .2s;
+  color: var(--navy); resize: vertical; min-height: 70px; transition: border .2s;
 }
 .reply-input:focus { outline: none; border-color: var(--green); }
 .btn-reply {
@@ -386,21 +445,68 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
 }
 .btn-reply:hover    { background: #245f3e; }
 .btn-reply:disabled { opacity: .6; }
-
 .empty { text-align: center; color: var(--gray); padding: 60px 20px; font-size: 14px; }
+
+/* ── ADMIN PANEL ─────────────────────────────────────────────────────────── */
+.admin-card {
+  background: var(--white); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 28px; box-shadow: 0 2px 8px rgba(0,0,0,.04);
+}
+.admin-card h3 {
+  font-size: 16px; font-weight: 700; color: var(--navy);
+  margin-bottom: 6px; display: flex; align-items: center; gap: 8px;
+}
+.admin-card .admin-desc {
+  font-size: 13px; color: var(--gray); margin-bottom: 24px; line-height: 1.5;
+}
+.admin-add-row {
+  display: flex; gap: 10px; margin-bottom: 20px;
+}
+.admin-add-row input {
+  flex: 1; padding: 10px 12px; border: 1.5px solid var(--border);
+  border-radius: 8px; font-family: var(--font); font-size: 14px; color: var(--navy);
+  transition: border .2s;
+}
+.admin-add-row input:focus { outline: none; border-color: var(--orange); }
+.btn-add {
+  padding: 10px 18px; background: var(--orange); color: var(--white);
+  border: none; border-radius: 8px; font-family: var(--font); font-size: 13px;
+  font-weight: 600; cursor: pointer; white-space: nowrap; transition: background .2s;
+}
+.btn-add:hover { background: #c44e00; }
+
+.admin-divider { border: none; border-top: 1px solid var(--border); margin-bottom: 16px; }
+#admin-emails-list { display: flex; flex-direction: column; gap: 8px; }
+.admin-email-row {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px;
+}
+.admin-email-text { font-size: 13px; color: var(--navy); font-weight: 500; }
+.btn-remove {
+  background: #fde8e8; color: #c0392b; border: none; border-radius: 6px;
+  padding: 5px 10px; font-size: 12px; font-family: var(--font); font-weight: 600;
+  cursor: pointer; transition: background .2s;
+}
+.btn-remove:hover { background: #f5c6c6; }
+.admin-empty { font-size: 13px; color: var(--gray); text-align: center; padding: 20px; }
+#admin-msg { margin-top: 12px; }
 
 /* Responsive */
 @media(max-width: 700px) {
-  .app-body   { flex-direction: column; }
+  #panel-demandes { flex-direction: column; }
   #form-section { width: 100%; min-width: unset; border-right: none;
                   border-bottom: 1px solid var(--border); }
   .topbar-left h2 { display: none; }
+  .tabs { gap: 2px; }
+  .tab-btn { padding: 5px 10px; font-size: 12px; }
+  #panel-admin { padding: 16px; }
 }
 </style>
 </head>
 <body>
 
-<!-- ═══ LOGIN ════════════════════════════════════════════════════════════════ -->
+<!-- ═══ LOGIN ═══════════════════════════════════════════════════════════════ -->
 <div id="screen-login">
   <div class="login-box">
     <div class="login-logo">
@@ -423,13 +529,22 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
   </div>
 </div>
 
-<!-- ═══ APP ═══════════════════════════════════════════════════════════════════ -->
+<!-- ═══ APP ════════════════════════════════════════════════════════════════ -->
 <div id="screen-app">
 
   <header class="topbar">
     <div class="topbar-left">
       <span class="ticon">🔧</span>
       <h2>Demandes Modification Popups</h2>
+      <nav class="tabs">
+        <button class="tab-btn active" data-tab="demandes" onclick="switchTab('demandes')">
+          📋 Demandes
+        </button>
+        <button class="tab-btn" id="tab-admin" data-tab="admin" onclick="switchTab('admin')"
+                style="display:none">
+          ⚙️ Administration
+        </button>
+      </nav>
     </div>
     <div class="topbar-right">
       <div class="user-pill">
@@ -440,12 +555,11 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
     </div>
   </header>
 
-  <div class="app-body">
+  <!-- ── Onglet Demandes ── -->
+  <div id="panel-demandes">
 
-    <!-- Formulaire (masqué pour Qualité) -->
     <aside id="form-section">
       <h3>Nouvelle demande</h3>
-
       <div class="field">
         <label>Symbole</label>
         <input type="text" id="f-symbole" placeholder="ex. SYM-042">
@@ -458,14 +572,10 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
         <label>Raison de la demande</label>
         <textarea id="f-raison" placeholder="Décrivez pourquoi cette popup doit être modifiée…"></textarea>
       </div>
-
-      <button class="btn-primary" id="btn-submit" onclick="submitDemande()">
-        Envoyer la demande
-      </button>
+      <button class="btn-primary" id="btn-submit" onclick="submitDemande()">Envoyer la demande</button>
       <div id="form-msg" class="form-msg"></div>
     </aside>
 
-    <!-- Liste des demandes -->
     <main class="list-panel">
       <div class="list-panel-header">
         <h3>Demandes en cours</h3>
@@ -475,7 +585,28 @@ body { font-family: var(--font); background: var(--bg); color: #1a1a2e; min-heig
     </main>
 
   </div>
-</div>
 
+  <!-- ── Onglet Administration ── -->
+  <div id="panel-admin">
+    <div class="admin-card">
+      <h3>⚙️ Membres du service Qualité</h3>
+      <p class="admin-desc">
+        Les emails listés ici ont accès à la vue <strong>Service Qualité</strong> : ils voient toutes les demandes
+        et peuvent y apporter une réponse. La liste est stockée dans Firebase.
+      </p>
+
+      <div class="admin-add-row">
+        <input type="email" id="admin-new-email" placeholder="prenom.nom@domaine.fr"
+               onkeydown="if(event.key==='Enter') addQualiteEmail()">
+        <button class="btn-add" onclick="addQualiteEmail()">+ Ajouter</button>
+      </div>
+
+      <hr class="admin-divider">
+      <div id="admin-emails-list"></div>
+      <div id="admin-msg" class="form-msg"></div>
+    </div>
+  </div>
+
+</div>
 </body>
 </html>
